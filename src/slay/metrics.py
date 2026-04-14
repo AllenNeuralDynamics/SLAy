@@ -98,6 +98,7 @@ def compute_refractory_penalty(
     bin_size_ms: float,
     maximum_contamination: float,
     pair_mask: NDArray[np.bool_],
+    noise_margin_z: float = 2.0,
 ) -> NDArray[np.floating]:
     """
     Compute the refractory period violation penalty for all unit pairs.
@@ -114,6 +115,11 @@ def compute_refractory_penalty(
         The maximum acceptable contamination threshold.
     pair_mask : NDArray[np.bool_]
         Boolean mask indicating which unit pairs to compute penalties for.
+    noise_margin_z : float, default: 2.0
+        Number of Poisson standard deviations added to the expected count
+        threshold.  Prevents high-firing-rate neurons from being penalized
+        for statistically insignificant excursions above the contamination
+        threshold.
 
     Returns
     -------
@@ -129,7 +135,9 @@ def compute_refractory_penalty(
         return (
             i,
             j,
-            _sliding_RP_viol_pair(ccgs[i, j, :], bin_size_ms, maximum_contamination),
+            _sliding_RP_viol_pair(
+                ccgs[i, j, :], bin_size_ms, maximum_contamination, noise_margin_z,
+            ),
         )
 
     results = Parallel(n_jobs=-1)(
@@ -241,63 +249,101 @@ def _sliding_RP_viol_pair(
     ccg: NDArray[np.floating],
     bin_size_ms: float,
     accept_threshold: float = 0.15,
+    noise_margin_z: float = 2.0,
 ) -> float:
     """
-    Calculate the sliding refractory period violation confidence for a cluster.
+    Calculate the sliding refractory period violation confidence for a cluster pair.
 
     Adapted from the SpikeInterface/IBL sliding RP metric, but the baseline rate is
     based on the maximum rate of the smoothed correlogram, instead of the rate at 2s
     from the center.
 
+    Uses absolute refractory period test points (0.25–20 ms) instead of
+    bin-relative multiples, so that sub-millisecond refractory periods of
+    fast-spiking neurons (e.g. thalamic relay cells) can be resolved.  A
+    Poisson noise margin prevents high-firing-rate neurons from being
+    penalized for statistically insignificant excursions above the
+    contamination threshold.
+
     Parameters
     ----------
     ccg : NDArray[np.floating]
-        The auto-correlogram of the cluster.
+        The merged auto-correlogram of the cluster pair.
     bin_size_ms : float
         The width in ms of the bin size of the input ccgs.
     accept_threshold : float, default: 0.15
-        The minimum ccg firing rate in Hz.
+        The maximum acceptable contamination fraction relative to the
+        baseline firing rate.
+    noise_margin_z : float, default: 2.0
+        Number of Poisson standard deviations added to the expected count
+        threshold.
 
     Returns
     -------
     refractory_penalty : float
-        The refractory period violation confidence for the cluster.
+        The refractory period violation confidence for the cluster pair.
+        0 = clean refractory period, 1 = severe violations.
     """
-    # create various refractory periods sizes to test (between 0 and 20x bin size)
-    all_refractory_periods = np.arange(0, 21 * bin_size_ms, bin_size_ms) / 1000
-    test_refractory_period_indices = np.array([1, 2, 4, 6, 8, 12, 16, 20], dtype="int8")
-    test_refractory_periods = [
-        all_refractory_periods[test_rp_index]
-        for test_rp_index in test_refractory_period_indices
-    ]
+    # Absolute refractory period test points (ms).  Includes sub-ms points
+    # to resolve short refractory periods of fast-spiking neurons.
+    rp_test_ms = np.array(
+        [0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 8.0, 12.0, 16.0, 20.0]
+    )
+    # Convert to bin indices (1-based: bin 1 = 0–bin_size ms)
+    test_indices = np.round(rp_test_ms / bin_size_ms).astype(int)
 
-    # calculate and avg halves of ccg to ensure symmetry
-    # keep only second half of ccg, refractory period violations are compared from the center of ccg
-    half_len = int(ccg.shape[0] / 2)
-    ccg = (ccg[half_len:] + ccg[:half_len][::-1]) / 2
+    # Keep only test points that map to distinct, valid bins
+    n_bins_half = len(ccg) // 2
+    valid = (test_indices >= 1) & (test_indices <= n_bins_half)
+    test_indices = test_indices[valid]
+    rp_test_ms = rp_test_ms[valid]
+
+    if len(test_indices) == 0:
+        return 0.0
+
+    # Deduplicate indices that map to the same bin (keep the first = shortest RP)
+    _, unique_idx = np.unique(test_indices, return_index=True)
+    test_indices = test_indices[unique_idx]
+    rp_test_ms = rp_test_ms[unique_idx]
+
+    # Average both halves of ccg to ensure symmetry, keep the positive-lag half.
+    # Handle both even-length and odd-length (center bin excluded) CCGs.
+    if len(ccg) % 2 == 1:
+        half = len(ccg) // 2
+        ccg = (ccg[half + 1:] + ccg[:half][::-1]) / 2
+    else:
+        half = len(ccg) // 2
+        ccg = (ccg[half:] + ccg[:half][::-1]) / 2
 
     ccg_cumsum = np.cumsum(ccg)
-    sum_res = ccg_cumsum[
-        test_refractory_period_indices - 1
-    ]  # -1 bc 0th bin corresponds to 0-bin_size ms
+    sum_res = ccg_cumsum[test_indices - 1]  # -1 bc 0th bin = 0–bin_size ms
 
-    # low-pass filter ccg and use max as baseline event rate
+    # Low-pass filter ccg and use max as baseline event rate
     order = 4
     cutoff_freq = 250  # Hz
     fs = 1 / bin_size_ms * 1000
-    nyqist = fs / 2
-    cutoff = cutoff_freq / nyqist
-    sos = butter(order, cutoff, btype="low", output="sos")
-    smoothed_ccg = sosfiltfilt(sos, ccg)
+    nyquist = fs / 2
+    cutoff = cutoff_freq / nyquist
+    if cutoff >= 1.0:
+        # Bin size too coarse for this filter — use unfiltered max
+        smoothed_ccg = ccg
+    else:
+        sos = butter(order, cutoff, btype="low", output="sos")
+        smoothed_ccg = sosfiltfilt(sos, ccg)
 
     max_bin_rate = np.max(smoothed_ccg)
-    max_conts_max = (
-        np.array(test_refractory_periods)
-        / bin_size_ms
-        * 1000
-        * (max_bin_rate * accept_threshold)
+
+    # Expected counts at each RP under accept_threshold contamination,
+    # plus a Poisson noise margin so high-firing-rate pairs are not
+    # penalized for small excursions within sampling noise.
+    rp_test_s = rp_test_ms / 1000
+    bin_size_s = bin_size_ms / 1000
+    max_conts_base = (rp_test_s / bin_size_s) * (max_bin_rate * accept_threshold)
+    max_conts_max = max_conts_base + noise_margin_z * np.sqrt(
+        np.maximum(max_conts_base, 1.0)
     )
-    # compute confidence of less than acceptThresh contamination at each refractory period
+
+    # Confidence of less than accept_threshold contamination at each RP
     confs = 1 - poisson.cdf(sum_res, max_conts_max)
     refractory_penalty = 1 - confs.max()
 

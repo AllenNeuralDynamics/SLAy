@@ -36,10 +36,11 @@ def compute_slay_merges(
     model_path: str | None = None,
     correlogram_params: dict[str, Any] = {
         "window_ms": 100,
-        "bin_ms": 0.5,
+        "bin_ms": 0.25,
         "method": "auto",
     },
     maximum_contamination: float = 0.15,
+    noise_margin_z: float = 2.0,
     similarity_type: str = "autoencoder",
     **job_kwargs: dict[str, Any],
 ) -> tuple[list[list[int]], SortingAnalyzer, dict[str, NDArray[np.floating]]]:
@@ -76,10 +77,17 @@ def compute_slay_merges(
         Path to a saved autoencoder model. If provided and exists, loads the model
         instead of training a new one (unless retrain_autoencoder=True).
         Only used when similarity_type="autoencoder".
-    correlogram_params : dict[str, Any], default: {"window_ms": 100, "bin_ms": 0.5, "method": "auto"}
-        Parameters for computing cross-correlograms.
+    correlogram_params : dict[str, Any], default: {"window_ms": 100, "bin_ms": 0.25, "method": "auto"}
+        Parameters for computing cross-correlograms.  The default bin_ms of
+        0.25 ms provides sub-millisecond resolution needed for fast-spiking
+        neurons with short refractory periods.
     maximum_contamination : float, default: 0.15
         Maximum acceptable contamination threshold for refractory period violations.
+    noise_margin_z : float, default: 2.0
+        Number of Poisson standard deviations added to the expected count
+        threshold in the refractory penalty.  Prevents high-firing-rate
+        neurons from being penalized for statistically insignificant
+        excursions above the contamination threshold.
     similarity_type : str, default: "autoencoder"
         Method for computing similarity: "autoencoder" or "l2".
     job_kwargs : dict[str, Any], default: {}
@@ -115,6 +123,7 @@ def compute_slay_merges(
         model_path,
         correlogram_params,
         maximum_contamination,
+        noise_margin_z,
         similarity_type,
         **job_kwargs,
     )
@@ -162,6 +171,7 @@ def compute_slay_metrics(
     model_path,
     correlogram_params,
     maximum_contamination,
+    noise_margin_z,
     similarity_type,
     **job_kwargs,
 ):
@@ -238,6 +248,7 @@ def compute_slay_metrics(
         correlogram_extension.params["bin_ms"],
         maximum_contamination,
         pair_mask,
+        noise_margin_z=noise_margin_z,
     )
 
     return similarity, ccg_metric, refractory_penalty
