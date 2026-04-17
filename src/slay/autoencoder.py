@@ -10,6 +10,7 @@ from scipy.sparse.csgraph import dijkstra
 from sklearn.model_selection import train_test_split
 from sklearn.neighbors import NearestNeighbors
 from spikeinterface.core import SortingAnalyzer, get_template_extremum_channel
+from spikeinterface.core.waveform_tools import extract_waveforms_to_single_buffer
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from tqdm import tqdm
 
@@ -65,6 +66,8 @@ def extract_spike_snippets(
     # Get recording, sorting, and templates
     recording = sorting_analyzer.recording
     unit_ids_list = sorting_analyzer.unit_ids
+    n_units = len(unit_ids_list)
+    num_chan = autoencoder_params["num_chan"]
 
     # Calculate timing parameters
     sampling_frequency = recording.get_sampling_frequency()
@@ -75,70 +78,86 @@ def extract_spike_snippets(
     last_sample = sorting_analyzer.recording.get_total_samples()
     num_samples = num_samples_before + num_samples_after
 
-    # Pre-compute the set of closest channels for each unit ordered by distance from peak and the total number of snippets
-    chans = {}
+    # Per-unit channel selection ordered by distance from peak
     peak_chans = get_template_extremum_channel(
         sorting_analyzer, peak_sign="both", outputs="index"
     )
-    num_snippets = 0
-    random_spikes = random_spikes_ext.get_random_spikes()
-    spikes_in_bounds = (random_spikes["sample_index"] >= num_samples_before) & (
-        random_spikes["sample_index"] <= last_sample - num_samples_after - 1
-    )
-    for unit_idx in range(len(unit_ids_list)):
+    chans = {}
+    for unit_idx in range(n_units):
         chans[unit_idx] = get_channels_by_distance(
             peak_chans[unit_ids_list[unit_idx]],
             sorting_analyzer,
-            autoencoder_params["num_chan"],
+            num_chan,
         )
 
-        num_spikes = np.sum(
-            (random_spikes["unit_index"] == unit_idx) & spikes_in_bounds
-        )
-        num_snippets += num_spikes
-
-    # Pre-allocate memory for the snippets
-    spikes = np.zeros(
-        (
-            num_snippets,
-            autoencoder_params["num_chan"] * num_samples,
-        ),
-        dtype=np.float32,
+    # Filter out edge spikes (SI treats them as zero-padded; we drop them entirely).
+    random_spikes = random_spikes_ext.get_random_spikes()
+    in_bounds = (random_spikes["sample_index"] >= num_samples_before) & (
+        random_spikes["sample_index"] <= last_sample - num_samples_after - 1
     )
-    spike_labels = np.zeros(num_snippets, dtype="int32")
+    in_bounds_spikes = random_spikes[in_bounds]
+    num_snippets = in_bounds_spikes.size
 
-    # Extract waveforms from recording traces for each unit
-    snip_idx = 0
-    for unit_idx in tqdm(range(len(unit_ids_list)), desc="Extracting snippets"):
-        spike_times = random_spikes["sample_index"][
-            (random_spikes["unit_index"] == unit_idx) & spikes_in_bounds
-        ]
-        desired_channels = chans[unit_idx]
-        n_spikes_unit = len(spike_times)
+    if num_snippets == 0:
+        empty = np.zeros((0, num_chan * num_samples), dtype=np.float32)
+        return torch.Tensor(empty).to(device), np.zeros(0, dtype="int32")
 
-        # Extract waveforms for all spikes
-        snippets = np.zeros(
-            (n_spikes_unit, autoencoder_params["num_chan"] * num_samples)
+    # Build a dense sparsity mask: each unit marks its num_chan closest channels.
+    # extract_waveforms_to_single_buffer returns shape
+    # (n_spikes, n_samples, max_chans_per_unit) with channels in ascending
+    # channel-index order within each unit's mask. Since every unit selects the
+    # same count, max_chans_per_unit == num_chan.
+    channel_ids = recording.channel_ids
+    n_channels_total = len(channel_ids)
+    ch_id_to_idx = {ch_id: i for i, ch_id in enumerate(channel_ids)}
+
+    sparsity_mask = np.zeros((n_units, n_channels_total), dtype=bool)
+    # Per-unit permutation: given the sparse-output column order (ascending
+    # channel index), produce the distance-sorted order the rest of SLAy expects.
+    reorder_per_unit = np.zeros((n_units, num_chan), dtype=np.int64)
+    for unit_idx in range(n_units):
+        dist_sorted_ids = chans[unit_idx]
+        dist_sorted_idx = np.array(
+            [ch_id_to_idx[cid] for cid in dist_sorted_ids], dtype=np.int64
         )
+        sparsity_mask[unit_idx, dist_sorted_idx] = True
+        sparse_order = np.sort(dist_sorted_idx)
+        reorder_per_unit[unit_idx] = np.searchsorted(sparse_order, dist_sorted_idx)
 
-        for i, spike_time in enumerate(spike_times):
-            start_frame = int(spike_time - num_samples_before)
-            end_frame = int(spike_time + num_samples_after)
+    # Single chunked pass over the recording — each zarr/wavpack chunk is
+    # decompressed once and all spikes inside it are extracted together.
+    # `return_in_uV=False` + no amplitude normalization matches PR #33's
+    # intentional simplification (snippets feed the AE as raw ADC values).
+    waveforms = extract_waveforms_to_single_buffer(
+        recording,
+        in_bounds_spikes,
+        unit_ids_list,
+        num_samples_before,
+        num_samples_after,
+        mode="shared_memory",
+        return_in_uV=False,
+        sparsity_mask=sparsity_mask,
+        copy=True,
+        job_name="slay_extract_snippets",
+    )
+    # waveforms: (n_spikes, n_samples, num_chan) in ascending channel-index order.
 
-            snippets[i] = recording.get_traces(
-                start_frame=start_frame,
-                end_frame=end_frame,
-                channel_ids=desired_channels,
-                return_in_uV=False,
-            ).flatten()
+    # Reorder channels per-spike into distance-from-peak order.
+    unit_indices = in_bounds_spikes["unit_index"]
+    per_spike_reorder = reorder_per_unit[unit_indices]  # (n_spikes, num_chan)
+    spike_range = np.arange(num_snippets, dtype=np.int64)[:, None, None]
+    sample_range = np.arange(num_samples, dtype=np.int64)[None, :, None]
+    col_range = per_spike_reorder[:, None, :]
+    reordered = waveforms[spike_range, sample_range, col_range]
 
-        # Store unit labels and waveforms
-        spike_labels[snip_idx : snip_idx + n_spikes_unit] = unit_idx
-        spikes[snip_idx : snip_idx + n_spikes_unit, :] = snippets
+    # Flatten to (n_spikes, num_chan * num_samples), matching the previous
+    # samples-major / channels-minor layout from ndarray.flatten() on
+    # (n_samples, num_chan).
+    snippets = reordered.reshape(num_snippets, -1).astype(np.float32, copy=False)
 
-        snip_idx += n_spikes_unit
+    spike_labels = unit_indices.astype("int32", copy=False)
 
-    return torch.Tensor(spikes).to(device), spike_labels
+    return torch.Tensor(snippets).to(device), spike_labels
 
 
 class SpikeDataset(Dataset):
