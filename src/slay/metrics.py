@@ -80,7 +80,7 @@ def compute_ccg_metric(
             _compute_ccg_metric_pair(ccgs[i, j, :], bin_size_s, min_ccg_rate=1000),
         )
 
-    results = Parallel(n_jobs=-1)(
+    results = Parallel(n_jobs=-1, backend="threading")(
         delayed(compute_pair)(i, j)
         for i, j in tqdm(pairs, desc="Calculating CCG significance")
     )
@@ -132,7 +132,7 @@ def compute_refractory_penalty(
             _sliding_RP_viol_pair(ccgs[i, j, :], bin_size_ms, maximum_contamination),
         )
 
-    results = Parallel(n_jobs=-1)(
+    results = Parallel(n_jobs=-1, backend="threading")(
         delayed(compute_pair)(i, j)
         for i, j in tqdm(pairs, desc="Calculating refractory penalty")
     )
