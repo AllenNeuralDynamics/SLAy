@@ -17,6 +17,120 @@ from tqdm import tqdm
 from .utils import get_channels_by_distance
 
 
+def _extract_from_waveforms_extension(
+    sorting_analyzer: SortingAnalyzer,
+    autoencoder_params: dict[str, Any],
+) -> tuple[torch.Tensor, NDArray[np.int_]] | None:
+    """Fast path: slice cached waveforms extension instead of reading recording.
+
+    Returns ``None`` to signal fallback if any of the following holds:
+      - ``waveforms`` / ``random_spikes`` extension not present
+      - no sparsity defined
+      - waveforms window narrower than requested SLAy window
+      - any unit's sparsity doesn't contain all ``num_chan`` closest
+        channels (SLAy would have to read those from the recording)
+
+    When usable, the speedup is large: memory-bound gather vs. replaying
+    the full preprocessing chain per chunk.
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    wf_ext = sorting_analyzer.get_extension("waveforms")
+    rs_ext = sorting_analyzer.get_extension("random_spikes")
+    if wf_ext is None or rs_ext is None:
+        return None
+    sparsity = sorting_analyzer.sparsity
+    if sparsity is None:
+        return None
+
+    num_chan = autoencoder_params["num_chan"]
+    fs = sorting_analyzer.sampling_frequency
+    slay_ms_before = autoencoder_params.get("ms_before", 1 / 3)
+    slay_ms_after = autoencoder_params.get("ms_after", 1.0)
+    slay_nbefore = int(slay_ms_before * fs / 1000)
+    slay_nafter = int(slay_ms_after * fs / 1000)
+
+    wf_nbefore = int(wf_ext.params["ms_before"] * fs / 1000)
+    wf_nafter = int(wf_ext.params["ms_after"] * fs / 1000)
+    if wf_nbefore < slay_nbefore or wf_nafter < slay_nafter:
+        return None
+
+    unit_ids_list = sorting_analyzer.unit_ids
+    n_units = len(unit_ids_list)
+
+    peak_chans = get_template_extremum_channel(
+        sorting_analyzer, peak_sign="both", outputs="index",
+    )
+
+    # Channel locations from the analyzer (no recording required) — we
+    # do the distance sort inline rather than calling get_channels_by_distance,
+    # since that helper requires an attached recording.
+    channel_locations = sorting_analyzer.get_channel_locations()
+    all_channel_ids = list(sorting_analyzer.channel_ids)
+
+    # For each unit, pick the num_chan channels nearest to its peak that
+    # are present in the unit's sparsity. Channels outside the sparsity
+    # are there because SI determined the unit has no meaningful signal
+    # on them, so swapping a missing geometric-nearest channel for a
+    # slightly-farther sparse one only removes noise-only channels from
+    # the AE input — which is what SLAy wants the AE to learn from anyway.
+    #
+    # Bail out to fallback if any unit's sparsity has fewer than num_chan
+    # channels (can't satisfy the window without zero-padding).
+    per_unit_slots = np.zeros((n_units, num_chan), dtype=np.int64)
+    for unit_idx, unit_id in enumerate(unit_ids_list):
+        sparse_ids = list(sparsity.unit_id_to_channel_ids[unit_id])
+        if len(sparse_ids) < num_chan:
+            return None
+
+        sparse_idx = np.array(
+            [all_channel_ids.index(cid) for cid in sparse_ids], dtype=np.int64,
+        )
+        peak_idx = peak_chans[unit_id]
+        distances = np.linalg.norm(
+            channel_locations[sparse_idx] - channel_locations[peak_idx], axis=1,
+        )
+        nearest = np.argsort(distances, kind="stable")[:num_chan]
+        # slots are positions within the waveforms extension's per-unit
+        # channel axis, which stores sparse channels in ascending-id order
+        # (i.e. the same order as sparse_ids itself).
+        per_unit_slots[unit_idx] = nearest
+
+    waveforms = wf_ext.get_data()  # (n_spikes, n_samples_wide, max_sparse_chans)
+    random_spikes = rs_ext.get_random_spikes()
+    assert waveforms.shape[0] == random_spikes.size, (
+        "waveforms extension spike count doesn't match random_spikes"
+    )
+    num_snippets = waveforms.shape[0]
+    num_samples = slay_nbefore + slay_nafter
+
+    if num_snippets == 0:
+        empty = np.zeros((0, num_chan * num_samples), dtype=np.float32)
+        return torch.Tensor(empty).to(device), np.zeros(0, dtype="int32")
+
+    # Truncate time window: start at the slay-aligned offset in the wider
+    # cached window.
+    time_start = wf_nbefore - slay_nbefore
+    time_end = time_start + num_samples
+
+    unit_indices = random_spikes["unit_index"]
+    per_spike_slots = per_unit_slots[unit_indices]  # (n_spikes, num_chan)
+
+    # Advanced indexing: gather (time_slice, distance-sorted channels) per spike.
+    spike_range = np.arange(num_snippets, dtype=np.int64)[:, None, None]
+    sample_range = np.arange(time_start, time_end, dtype=np.int64)[None, :, None]
+    col_range = per_spike_slots[:, None, :]
+    reordered = waveforms[spike_range, sample_range, col_range]
+    # (n_spikes, num_samples, num_chan)
+
+    snippets = reordered.reshape(num_snippets, -1).astype(np.float32, copy=False)
+    # Per-spike amplitude normalization was dropped upstream in PR #33;
+    # both the slow (``extract_waveforms_to_single_buffer``) and fast
+    # (cached-waveforms) paths now feed raw shapes into the AE.
+
+    return torch.Tensor(snippets).to(device), unit_indices.astype("int32", copy=False)
+
+
 def extract_spike_snippets(
     sorting_analyzer: SortingAnalyzer,
     autoencoder_params: dict[str, Any],
@@ -30,14 +144,19 @@ def extract_spike_snippets(
     info about the absolute position of the spikes, so the autoencoder can focus only
     on waveform shape.
 
-    Spike waveforms are extracted directly from the recording using the spike times
-    from the "random_spikes" extension.
+    Snippets come from the "waveforms" extension when it is present, covers
+    the needed time window, and its sparsity contains SLAy's per-unit closest
+    channels; otherwise we fall back to reading from the recording via
+    ``extract_waveforms_to_single_buffer``. The cached-waveforms path is
+    dramatically faster because it skips the preprocessing chain entirely.
 
     Args:
         sorting_analyzer (SortingAnalyzer): A SpikeInterface SortingAnalyzer object.
             Must have the following extensions computed:
                 - "templates": Average waveforms per unit (used for channel selection)
                 - "random_spikes": Random spike selection for training
+            Optional but strongly preferred:
+                - "waveforms": Per-spike waveforms, already preprocessed
         autoencoder_params (dict): Autoencoder configuration parameters:
             - n_chan (int): Total number of channels on the probe.
             - num_chan (int): Number of channels to include in each spike snippet.
@@ -50,6 +169,15 @@ def extract_spike_snippets(
             if available.
         unit_ids (NDArray): Unit labels of spike snippets with shape (# snippets).
     """
+    # Fast path: read preprocessed per-spike waveforms directly from the
+    # cached "waveforms" extension, skipping the recording's preprocessing
+    # chain entirely. Falls back to None if the extension is missing, has
+    # an incompatible time window, or lacks SLAy's per-unit closest channels
+    # in its sparsity.
+    fast = _extract_from_waveforms_extension(sorting_analyzer, autoencoder_params)
+    if fast is not None:
+        return fast
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Get required extensions
