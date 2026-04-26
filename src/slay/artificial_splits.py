@@ -2,7 +2,7 @@ import numpy as np
 from spikeinterface.core.sorting_tools import spike_vector_to_indices
 from spikeinterface.core import SortingAnalyzer
 from spikeinterface.qualitymetrics import compute_quality_metrics
-from slay.metrics import _sliding_RP_viol_pair
+from slay.metrics import _rp_smoothing_sos, _sliding_RP_viol_pair
 
 
 def make_artificial_splits(
@@ -112,10 +112,12 @@ def get_invalid_splits(split_analyzer, split_ids, max_id):
     for i in range(ccgs.shape[0]):
         acgs[i] = ccgs[i, i, :]
 
+    bin_size_ms = float(np.diff(ccg_bins)[0])
+    rp_sos = _rp_smoothing_sos(bin_size_ms)
     smoothed_slid_rps = np.zeros(acgs.shape[0])
     for i in range(acgs.shape[0]):
         smoothed_slid_rps[i] = _sliding_RP_viol_pair(
-            acgs[i], bin_size_ms=np.diff(ccg_bins)[0]
+            acgs[i], bin_size_ms=bin_size_ms, sos=rp_sos,
         )
 
     split_quality_metrics = quality_metrics[quality_metrics.index > max_id]

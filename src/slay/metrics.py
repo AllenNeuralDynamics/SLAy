@@ -70,14 +70,22 @@ def compute_ccg_metric(
     unit_ids = sorting_analyzer.unit_ids
     ccg_metric = np.zeros((len(unit_ids), len(unit_ids)))
 
-    pairs = np.argwhere(pair_mask)
+    # pair_mask is symmetric (similarity is symmetric, diagonal is zeroed),
+    # and the per-pair metric is invariant under CCG time-reversal, so we
+    # only walk the upper triangle and mirror the result on assignment.
+    pairs = np.argwhere(np.triu(pair_mask, k=1))
     bin_size_s = bin_size_ms / 1000
+    # Filter coefficients only depend on bin_size_s — derive once and reuse
+    # across all pairs to skip ~244K butter() invocations per probe.
+    sos = _ccg_smoothing_sos(bin_size_s)
 
     def compute_pair(i, j):
         return (
             i,
             j,
-            _compute_ccg_metric_pair(ccgs[i, j, :], bin_size_s, min_ccg_rate=1000),
+            _compute_ccg_metric_pair(
+                ccgs[i, j, :], bin_size_s, min_ccg_rate=1000, sos=sos,
+            ),
         )
 
     results = Parallel(n_jobs=-1, backend="threading")(
@@ -123,13 +131,17 @@ def compute_refractory_penalty(
     unit_ids = sorting_analyzer.unit_ids
     refractory_penalty = np.zeros((len(unit_ids), len(unit_ids)))
 
-    pairs = np.argwhere(pair_mask)
+    # See compute_ccg_metric: walk only the upper triangle and mirror.
+    pairs = np.argwhere(np.triu(pair_mask, k=1))
+    sos = _rp_smoothing_sos(bin_size_ms)
 
     def compute_pair(i, j):
         return (
             i,
             j,
-            _sliding_RP_viol_pair(ccgs[i, j, :], bin_size_ms, maximum_contamination),
+            _sliding_RP_viol_pair(
+                ccgs[i, j, :], bin_size_ms, maximum_contamination, sos=sos,
+            ),
         )
 
     results = Parallel(n_jobs=-1, backend="threading")(
@@ -144,10 +156,40 @@ def compute_refractory_penalty(
     return refractory_penalty
 
 
+def _ccg_smoothing_sos(bin_size_s: float) -> np.ndarray:
+    """Butterworth SOS coefficients used to smooth the CCG second derivative.
+
+    Hoisted out of ``_compute_ccg_metric_pair`` because the cutoff only
+    depends on ``bin_size_s`` (constant across all pairs in a CCG-metric
+    pass), and re-deriving the coefficients per pair was the dominant
+    cost in the inner loop (~670s cumulative on a 349-unit probe).
+    """
+    fs = 1 / bin_size_s
+    cutoff_freq = 100
+    nyquist = fs / 2
+    cutoff = cutoff_freq / nyquist
+    return butter(4, cutoff, output="sos")
+
+
+def _rp_smoothing_sos(bin_size_ms: float) -> np.ndarray:
+    """Butterworth SOS coefficients used to smooth the half-CCG baseline.
+
+    Hoisted out of ``_sliding_RP_viol_pair`` for the same reason as
+    ``_ccg_smoothing_sos``: the cutoff is a function of ``bin_size_ms``
+    only, not of the per-pair CCG.
+    """
+    fs = 1 / bin_size_ms * 1000
+    cutoff_freq = 250  # Hz
+    nyquist = fs / 2
+    cutoff = cutoff_freq / nyquist
+    return butter(4, cutoff, btype="low", output="sos")
+
+
 def _compute_ccg_metric_pair(
     ccg: NDArray[np.floating],
     bin_size_s: float,
     min_ccg_rate: float,
+    sos: NDArray[np.floating] | None = None,
 ) -> float:
     """
     Calculates a cross-correlation significance metric for a cluster pair.
@@ -173,14 +215,11 @@ def _compute_ccg_metric_pair(
         The calculated cross-correlation significance metric.
     """
     # calculate low-pass filtered second derivative of ccg
-    fs = 1 / bin_size_s
-    cutoff_freq = 100
-    nyquist = fs / 2
-    cutoff = cutoff_freq / nyquist
     peak_width = 0.002 / bin_size_s
 
     ccg_double_derivative = np.diff(ccg, 2)
-    sos = butter(4, cutoff, output="sos")
+    if sos is None:
+        sos = _ccg_smoothing_sos(bin_size_s)
     ccg_double_derivative = sosfiltfilt(sos, ccg_double_derivative)
 
     if ccg.sum() == 0:
@@ -241,6 +280,7 @@ def _sliding_RP_viol_pair(
     ccg: NDArray[np.floating],
     bin_size_ms: float,
     accept_threshold: float = 0.15,
+    sos: NDArray[np.floating] | None = None,
 ) -> float:
     """
     Calculate the sliding refractory period violation confidence for a cluster.
@@ -282,12 +322,8 @@ def _sliding_RP_viol_pair(
     ]  # -1 bc 0th bin corresponds to 0-bin_size ms
 
     # low-pass filter ccg and use max as baseline event rate
-    order = 4
-    cutoff_freq = 250  # Hz
-    fs = 1 / bin_size_ms * 1000
-    nyqist = fs / 2
-    cutoff = cutoff_freq / nyqist
-    sos = butter(order, cutoff, btype="low", output="sos")
+    if sos is None:
+        sos = _rp_smoothing_sos(bin_size_ms)
     smoothed_ccg = sosfiltfilt(sos, ccg)
 
     max_bin_rate = np.max(smoothed_ccg)
